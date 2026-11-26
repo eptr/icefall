@@ -1,0 +1,1173 @@
+#!/usr/bin/env python3
+#
+# Copyright 2023 Xiaomi Corporation (Author: Fangjun Kuang, Wei Kang)
+# Copyright 2023 Danqing Fu (danqing.fu@gmail.com)
+
+"""
+This script exports a transducer model from PyTorch to ONNX.
+
+Usage (after training with ./zipformer/train.py):
+
+./zipformer/export-onnx-streaming.py \
+  --tokens data/lang_phone/tokens.txt \
+  --epoch 13 \
+  --avg 2 \
+  --exp-dir zipformer/exp_tiny_cr_rnnt_all_data \
+  --num-encoder-layers "1,1,1,1,1,1" \
+  --downsampling-factor "1,2,4,8,4,2" \
+  --feedforward-dim "192,192,192,192,192,192" \
+  --num-heads "4,4,4,8,4,4" \
+  --encoder-dim "128,128,128,128,128,128" \
+  --query-head-dim 32 \
+  --value-head-dim 12 \
+  --pos-head-dim 4 \
+  --pos-dim 48 \
+  --encoder-unmasked-dim "128,128,128,128,128,128" \
+  --cnn-module-kernel "15,15,15,15,15,15" \
+  --decoder-dim 320 \
+  --joiner-dim 320 \
+  --causal True \
+  --chunk-size 16 \
+  --left-context-frames 64
+
+The --chunk-size in training is "8,16,32,-1", so we select one of them
+(excluding -1) during streaming export. The same applies to
+--left-context-frames, whose value is "64,128,256,-1".
+
+It will generate the following 3 files inside the exp dir:
+
+  - encoder-epoch-13-avg-2-chunk-16-left-64.onnx
+  - decoder-epoch-13-avg-2-chunk-16-left-64.onnx
+  - joiner-epoch-13-avg-2-chunk-16-left-64.onnx
+
+The exported models can be used with the sherpa-onnx keyword spotter, with
+--tokens-type phone+ppinyin and the lexicon data/lang_phone/g2p.dict
+(see sherpa-onnx-cli text2token).
+"""
+
+import argparse
+import copy
+import logging
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import k2
+import onnx
+import torch
+import torch.nn as nn
+from decoder import (
+    Decoder,
+    check_decoder_conv_as_matmul_onnx,
+    replace_decoder_conv_with_matmul,
+)
+from onnxruntime.quantization import QuantType, quantize_dynamic
+from scaling_converter import convert_scaled_to_non_scaled
+from train import add_model_arguments, get_model, get_params
+from zipformer import Zipformer2
+
+from icefall.checkpoint import (
+    average_checkpoints,
+    average_checkpoints_with_averaged_model,
+    find_checkpoints,
+    load_checkpoint,
+)
+from icefall.utils import num_tokens, str2bool
+from icefall.utils import get_onnx_export_kwargs
+
+
+def get_parser():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    parser.add_argument(
+        "--dynamic-batch",
+        type=int,
+        default=1,
+        help="1 to support dynamic batch size. 0 to support only batch size == 1",
+    )
+
+    parser.add_argument(
+        "--enable-int8-quantization",
+        type=int,
+        default=1,
+        help="1 to also export int8 onnx models.",
+    )
+
+    parser.add_argument(
+        "--use-int32-inputs",
+        type=int,
+        default=0,
+        help="""1 to use int32_t as input types if applicable. 0 to use
+        int64_t otherwise.""",
+    )
+
+    parser.add_argument(
+        "--is-rknn-export",
+        type=int,
+        default=0,
+        help="""1 if the exported models will be converted by rknn-toolkit2.
+        It keeps the padding masks as bool and avoids no-op Cast nodes, which
+        rknn-toolkit2 cannot convert (it aborts with "Meet unsupported conv,
+        input tensor name: ... input type: 6"). 0 to keep the previous
+        behavior.""",
+    )
+
+    parser.add_argument(
+        "--epoch",
+        type=int,
+        default=28,
+        help="""It specifies the checkpoint to use for averaging.
+        Note: Epoch counts from 0.
+        You can specify --avg to use more checkpoints for model averaging.""",
+    )
+
+    parser.add_argument(
+        "--iter",
+        type=int,
+        default=0,
+        help="""If positive, --epoch is ignored and it
+        will use the checkpoint exp_dir/checkpoint-iter.pt.
+        You can specify --avg to use more checkpoints for model averaging.
+        """,
+    )
+
+    parser.add_argument(
+        "--avg",
+        type=int,
+        default=15,
+        help="Number of checkpoints to average. Automatically select "
+        "consecutive checkpoints before the checkpoint specified by "
+        "'--epoch' and '--iter'",
+    )
+
+    parser.add_argument(
+        "--use-averaged-model",
+        type=str2bool,
+        default=True,
+        help="Whether to load averaged model. Currently it only supports "
+        "using --epoch. If True, it would decode with the averaged model "
+        "over the epoch range from `epoch-avg` (excluded) to `epoch`."
+        "Actually only the models with epoch number of `epoch-avg` and "
+        "`epoch` are loaded for averaging. ",
+    )
+
+    parser.add_argument(
+        "--exp-dir",
+        type=str,
+        default="zipformer/exp",
+        help="""It specifies the directory where all training related
+        files, e.g., checkpoints, log, etc, are saved
+        """,
+    )
+
+    parser.add_argument(
+        "--tokens",
+        type=str,
+        default="data/lang_phone/tokens.txt",
+        help="Path to the tokens.txt",
+    )
+
+    parser.add_argument(
+        "--context-size",
+        type=int,
+        default=2,
+        help="The context size in the decoder. 1 means bigram; 2 means tri-gram",
+    )
+
+    parser.add_argument(
+        "--fp16",
+        type=str2bool,
+        default=False,
+        help="Whether to export models in fp16",
+    )
+
+    parser.add_argument(
+        "--use-whisper-features",
+        type=str2bool,
+        default=False,
+        help="True to use whisper features. Must match the one used in training",
+    )
+
+    parser.add_argument(
+        "--decoder-conv-as-matmul",
+        type=str2bool,
+        default=False,
+        help="""True to export the decoder's grouped Conv1d as an equivalent
+        MatMul (same outputs up to float rounding). With ONNX Runtime's CUDA
+        provider this removes the Conv kernel's per-node lock, which
+        serializes a decoder session shared by several threads when the
+        batch size changes between runs.""",
+    )
+
+    parser.add_argument(
+        "--use-external-data",
+        type=str2bool,
+        default=False,
+        help="Set it to true for model file size > 2GB",
+    )
+
+    add_model_arguments(parser)
+
+    return parser
+
+
+def _load_float16_converter():
+    """Return the float16 conversion function.
+
+    onnxmltools <= 1.12 exposes it as onnxmltools.utils.float16_converter;
+    newer versions removed that module in favor of onnxconverter-common,
+    whose convert_float_to_float16() is the same implementation.
+    """
+    try:
+        from onnxmltools.utils.float16_converter import (  # noqa: F401
+            convert_float_to_float16,
+            convert_float_to_float16_model_path,
+        )
+    except ImportError:
+        from onnxconverter_common.float16 import (
+            convert_float_to_float16,
+            convert_float_to_float16_model_path,
+        )
+
+    return convert_float_to_float16, convert_float_to_float16_model_path
+
+
+def _fix_cast_nodes_after_fp16_conversion(model):
+    """Fix Cast nodes left inconsistent by convert_float_to_float16().
+
+    The converter (onnxconverter-common, which also backs
+    onnxmltools.utils.float16_converter) never updates the ``to`` attribute of
+    Cast nodes, yet it rewrites the declared type of every float32 tensor in
+    graph.value_info to float16. A Cast producing float32 is thus left with
+    ``to`` == float while its output is declared float16, and onnxruntime
+    (hence sherpa-onnx) refuses to load the exported model with
+
+      Type Error: Type (tensor(float16)) of output arg (/decoder/Cast_1_output_0)
+      of node (/decoder/Cast_1) does not match expected type (tensor(float)).
+
+    Such Cast nodes are common: e.g. the bool->float cast generated for
+    ``self.embedding(y.clamp(min=0)) * (y >= 0).unsqueeze(-1)`` in decoder.py.
+    Note that a model *trained* in fp16 exports with ``Cast(to=float16)``
+    there, which is why natively-fp16 models load fine and fp32-trained
+    ones converted by this script do not (see issue #2011).
+
+    The fix aligns ``to`` with the already-converted output type so the Cast
+    produces float16 directly, matching all its (already fp16) consumers.
+    Casts whose output is not declared float16 (e.g. ones the converter kept
+    in fp32) are left untouched.
+
+    See https://github.com/k2-fsa/icefall/issues/2011.
+    """
+    FLOAT = onnx.TensorProto.FLOAT
+    FLOAT16 = onnx.TensorProto.FLOAT16
+
+    def fix_graph(graph):
+        declared_fp16 = {
+            value_info.name
+            for value_info in list(graph.value_info) + list(graph.output)
+            if value_info.type.tensor_type.elem_type == FLOAT16
+        }
+        num_fixed = 0
+        for node in graph.node:
+            if node.op_type != "Cast":
+                continue
+            for attr in node.attribute:
+                if attr.name != "to" or attr.i != FLOAT:
+                    continue
+                if any(name in declared_fp16 for name in node.output):
+                    attr.i = FLOAT16
+                    num_fixed += 1
+        # recurse into sub-graphs, if any (If/Loop bodies)
+        for node in graph.node:
+            for attr in node.attribute:
+                if attr.HasField("g"):
+                    num_fixed += fix_graph(attr.g)
+                for sub_graph in attr.graphs:
+                    num_fixed += fix_graph(sub_graph)
+        return num_fixed
+
+    num_fixed = fix_graph(model.graph)
+    if num_fixed > 0:
+        logging.info(
+            f"Fixed {num_fixed} Cast node(s) whose 'to' attribute was left "
+            "float32 by the fp16 converter"
+        )
+    return model
+
+
+def _remove_noop_cast_nodes(model: onnx.ModelProto) -> int:
+    """Remove Cast nodes that don't change the element type.
+
+    PyTorch exports redundant Cast nodes in some cases, e.g. a bool->bool
+    cast from ``mask.to(torch.bool)`` when the mask is already bool.
+    rknn-toolkit2 cannot convert such nodes: it reports
+    "E RKNN: dataconvert type -1 is unsupport in current!" and aborts
+    (core dumped), so for --is-rknn-export 1 we drop them.  Removing a
+    no-op Cast does not change model semantics.
+
+    Returns the number of removed nodes.
+    """
+    model_with_types = onnx.shape_inference.infer_shapes(model)
+    elem_types = {}
+    for vi in (
+        list(model_with_types.graph.input)
+        + list(model_with_types.graph.value_info)
+        + list(model_with_types.graph.output)
+    ):
+        if vi.type.HasField("tensor_type"):
+            elem_types[vi.name] = vi.type.tensor_type.elem_type
+
+    graph = model.graph
+    output_names = {o.name for o in graph.output}
+
+    # name of a no-op Cast output -> name of its input
+    redirect = {}
+    for node in graph.node:
+        if node.op_type != "Cast":
+            continue
+        if len(node.input) != 1 or len(node.output) != 1:
+            continue
+        if node.output[0] in output_names:
+            # keep the node so graph outputs are not renamed
+            continue
+        to = None
+        for attr in node.attribute:
+            if attr.name == "to":
+                to = attr.i
+        in_type = elem_types.get(node.input[0])
+        if to is not None and in_type is not None and to == in_type:
+            redirect[node.output[0]] = node.input[0]
+
+    if not redirect:
+        return 0
+
+    def resolve(name: str) -> str:
+        """Follow chains of no-op casts and return the final tensor name."""
+        while name in redirect:
+            name = redirect[name]
+        return name
+
+    kept = []
+    for node in graph.node:
+        if len(node.output) == 1 and node.output[0] in redirect:
+            continue
+        for i, name in enumerate(node.input):
+            if name in redirect:
+                node.input[i] = resolve(name)
+        kept.append(node)
+
+    del graph.node[:]
+    graph.node.extend(kept)
+    return len(redirect)
+
+
+def export_onnx_fp16(onnx_fp32_path, onnx_fp16_path):
+    import onnxmltools
+
+    convert_float_to_float16, _ = _load_float16_converter()
+
+    onnx_fp32_model = onnxmltools.utils.load_model(onnx_fp32_path)
+    onnx_fp16_model = convert_float_to_float16(onnx_fp32_model, keep_io_types=True)
+    _fix_cast_nodes_after_fp16_conversion(onnx_fp16_model)
+    onnxmltools.utils.save_model(onnx_fp16_model, onnx_fp16_path)
+
+
+def export_onnx_fp16_large_2gb(onnx_fp32_path, onnx_fp16_path):
+    import onnxmltools
+
+    _, convert_float_to_float16_model_path = _load_float16_converter()
+
+    onnx_fp16_model = convert_float_to_float16_model_path(
+        onnx_fp32_path, keep_io_types=True
+    )
+    _fix_cast_nodes_after_fp16_conversion(onnx_fp16_model)
+    onnxmltools.utils.save_model(onnx_fp16_model, onnx_fp16_path)
+
+
+def add_meta_data(
+    filename: str, meta_data: Dict[str, str], use_external_data: bool = False
+):
+    """Add meta data to an ONNX model. It is changed in-place.
+
+    Args:
+      filename:
+        Filename of the ONNX model to be changed.
+      meta_data:
+        Key-value pairs.
+    """
+    model = onnx.load(filename)
+    for key, value in meta_data.items():
+        meta = model.metadata_props.add()
+        meta.key = key
+        meta.value = value
+
+    if use_external_data:
+        # For models file size > 2GB
+        external_filename = Path(filename).stem
+
+        onnx.save(
+            model,
+            filename,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=external_filename + ".weights",
+        )
+    else:
+        onnx.save(model, filename)
+
+
+class OnnxEncoder(nn.Module):
+    """A wrapper for Zipformer and the encoder_proj from the joiner"""
+
+    def __init__(
+        self,
+        encoder: Zipformer2,
+        encoder_embed: nn.Module,
+        encoder_proj: nn.Linear,
+        is_rknn_export: int = 0,
+    ):
+        """
+        Args:
+          encoder:
+            A Zipformer encoder.
+          encoder_proj:
+            The projection layer for encoder from the joiner.
+          is_rknn_export:
+            1 to generate a graph that rknn-toolkit2 can convert; 0 otherwise.
+        """
+        super().__init__()
+        self.encoder = encoder
+        self.encoder_embed = encoder_embed
+        self.encoder_proj = encoder_proj
+        self.chunk_size = encoder.chunk_size[0]
+        self.left_context_len = encoder.left_context_frames[0]
+        self.pad_length = 7 + 2 * 3
+        self.is_rknn_export = is_rknn_export
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        states: List[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """Encode a chunk of features given the current streaming states.
+
+        Args:
+          x:
+            A tensor of shape (N, T, feature_dim).
+          states:
+            The streaming states from the previous chunk.
+
+        Returns:
+          Return a tuple containing the encoded output of shape
+          (N, T, joiner_dim) and the updated streaming states.
+        """
+        N = x.size(0)
+        T = self.chunk_size * 2 + self.pad_length
+        x_lens = torch.tensor([T] * N, device=x.device)
+        left_context_len = self.left_context_len
+
+        cached_embed_left_pad = states[-2]
+        x, x_lens, new_cached_embed_left_pad = self.encoder_embed.streaming_forward(
+            x=x,
+            x_lens=x_lens,
+            cached_left_pad=cached_embed_left_pad,
+        )
+        assert x.size(1) == self.chunk_size, (x.size(1), self.chunk_size)
+
+        # For rknn export, keep the masks bool: with int32 masks rknn-toolkit2
+        # fails to convert the encoder with
+        #   E RKNN: Meet unsupported conv, input tensor name: ... input type: 6
+        # and aborts (core dumped). Otherwise keep the historical int32 masks.
+        if self.is_rknn_export:
+            mask_dtype = torch.bool
+        else:
+            mask_dtype = torch.int32
+
+        src_key_padding_mask = torch.zeros(N, self.chunk_size, dtype=mask_dtype)
+
+        # processed_mask is used to mask out initial states
+        processed_mask = torch.arange(left_context_len, device=x.device).expand(
+            x.size(0), left_context_len
+        )
+        processed_lens = states[-1]  # (batch,)
+        # (batch, left_context_size)
+        processed_mask = processed_lens.unsqueeze(1) <= processed_mask
+        if not self.is_rknn_export:
+            processed_mask = processed_mask.to(torch.int32)
+        processed_mask = processed_mask.flip(1)
+        # Update processed lengths
+        new_processed_lens = processed_lens + x_lens
+        # (batch, left_context_size + chunk_size)
+        src_key_padding_mask = torch.cat([processed_mask, src_key_padding_mask], dim=1)
+
+        x = x.permute(1, 0, 2)
+        encoder_states = states[:-2]
+        logging.info(f"len_encoder_states={len(encoder_states)}")
+        (
+            encoder_out,
+            encoder_out_lens,
+            new_encoder_states,
+        ) = self.encoder.streaming_forward(
+            x=x,
+            x_lens=x_lens,
+            states=encoder_states,
+            src_key_padding_mask=src_key_padding_mask,
+        )
+        encoder_out = encoder_out.permute(1, 0, 2)
+        encoder_out = self.encoder_proj(encoder_out)
+        # Now encoder_out is of shape (N, T, joiner_dim)
+
+        if self.is_rknn_export and new_processed_lens.dtype == states[-1].dtype:
+            # Skip the no-op cast: rknn-toolkit2 cannot convert it.
+            new_processed_lens_out = new_processed_lens
+        else:
+            new_processed_lens_out = new_processed_lens.to(states[-1].dtype)
+
+        new_states = new_encoder_states + [
+            new_cached_embed_left_pad,
+            new_processed_lens_out,
+        ]
+
+        return encoder_out, new_states
+
+    def get_init_states(
+        self,
+        batch_size: int = 1,
+        device: torch.device = torch.device("cpu"),
+    ) -> List[torch.Tensor]:
+        """
+        Returns a list of cached tensors of all encoder layers. For layer-i, states[i*6:(i+1)*6]
+        is (cached_key, cached_nonlin_attn, cached_val1, cached_val2, cached_conv1, cached_conv2).
+        states[-2] is the cached left padding for ConvNeXt module,
+        of shape (batch_size, num_channels, left_pad, num_freqs)
+        states[-1] is processed_lens of shape (batch,), which records the number
+        of processed frames (at 50hz frame rate, after encoder_embed) for each sample in batch.
+        """
+        states = self.encoder.get_init_states(batch_size, device)
+
+        embed_states = self.encoder_embed.get_init_states(batch_size, device)
+
+        states.append(embed_states)
+
+        processed_lens = torch.zeros(batch_size, dtype=torch.int64, device=device)
+        states.append(processed_lens)
+
+        return states
+
+
+class OnnxDecoder(nn.Module):
+    """A wrapper for Decoder and the decoder_proj from the joiner"""
+
+    def __init__(self, decoder: Decoder, decoder_proj: nn.Linear):
+        super().__init__()
+        self.decoder = decoder
+        self.decoder_proj = decoder_proj
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+          y:
+            A 2-D tensor of shape (N, context_size).
+        Returns
+          Return a 2-D tensor of shape (N, joiner_dim)
+        """
+        need_pad = False
+        decoder_output = self.decoder(y, need_pad=need_pad)
+        decoder_output = decoder_output.squeeze(1)
+        output = self.decoder_proj(decoder_output)
+
+        return output
+
+
+class OnnxJoiner(nn.Module):
+    """A wrapper for the joiner"""
+
+    def __init__(self, output_linear: nn.Linear):
+        super().__init__()
+        self.output_linear = output_linear
+
+    def forward(
+        self,
+        encoder_out: torch.Tensor,
+        decoder_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+          encoder_out:
+            A 2-D tensor of shape (N, joiner_dim)
+          decoder_out:
+            A 2-D tensor of shape (N, joiner_dim)
+        Returns:
+          Return a 2-D tensor of shape (N, vocab_size)
+        """
+        logit = encoder_out + decoder_out
+        logit = self.output_linear(torch.tanh(logit))
+        return logit
+
+
+def export_encoder_model_onnx(
+    encoder_model: OnnxEncoder,
+    encoder_filename: str,
+    opset_version: int = 11,
+    feature_dim: int = 80,
+    dynamic_batch: bool = True,
+    use_whisper_features: bool = False,
+    use_external_data: bool = False,
+    use_int32_inputs: int = 0,
+) -> None:
+    encoder_model.encoder.__class__.forward = (
+        encoder_model.encoder.__class__.streaming_forward
+    )
+
+    decode_chunk_len = encoder_model.chunk_size * 2
+    # The encoder_embed subsample features (T - 7) // 2
+    # The ConvNeXt module needs (7 - 1) // 2 = 3 frames of right padding after subsampling
+    T = decode_chunk_len + encoder_model.pad_length
+
+    x = torch.rand(1, T, feature_dim, dtype=torch.float32)
+    init_state = encoder_model.get_init_states()
+
+    if use_int32_inputs:
+        init_state = [
+            s if s.dtype != torch.int64 else s.to(torch.int32) for s in init_state
+        ]
+
+    num_encoders = len(encoder_model.encoder.encoder_dim)
+    logging.info(f"num_encoders: {num_encoders}")
+    logging.info(f"len(init_state): {len(init_state)}")
+
+    inputs = {}
+    input_names = ["x"]
+
+    outputs = {}
+    output_names = ["encoder_out"]
+
+    def build_inputs_outputs(tensors, i):
+        assert len(tensors) == 6, len(tensors)
+
+        # (downsample_left, batch_size, key_dim)
+        name = f"cached_key_{i}"
+        logging.info(f"{name}.shape: {tensors[0].shape}")
+        inputs[name] = {1: "N"}
+        outputs[f"new_{name}"] = {1: "N"}
+        input_names.append(name)
+        output_names.append(f"new_{name}")
+
+        # (1, batch_size, downsample_left, nonlin_attn_head_dim)
+        name = f"cached_nonlin_attn_{i}"
+        logging.info(f"{name}.shape: {tensors[1].shape}")
+        inputs[name] = {1: "N"}
+        outputs[f"new_{name}"] = {1: "N"}
+        input_names.append(name)
+        output_names.append(f"new_{name}")
+
+        # (downsample_left, batch_size, value_dim)
+        name = f"cached_val1_{i}"
+        logging.info(f"{name}.shape: {tensors[2].shape}")
+        inputs[name] = {1: "N"}
+        outputs[f"new_{name}"] = {1: "N"}
+        input_names.append(name)
+        output_names.append(f"new_{name}")
+
+        # (downsample_left, batch_size, value_dim)
+        name = f"cached_val2_{i}"
+        logging.info(f"{name}.shape: {tensors[3].shape}")
+        inputs[name] = {1: "N"}
+        outputs[f"new_{name}"] = {1: "N"}
+        input_names.append(name)
+        output_names.append(f"new_{name}")
+
+        # (batch_size, embed_dim, conv_left_pad)
+        name = f"cached_conv1_{i}"
+        logging.info(f"{name}.shape: {tensors[4].shape}")
+        inputs[name] = {0: "N"}
+        outputs[f"new_{name}"] = {0: "N"}
+        input_names.append(name)
+        output_names.append(f"new_{name}")
+
+        # (batch_size, embed_dim, conv_left_pad)
+        name = f"cached_conv2_{i}"
+        logging.info(f"{name}.shape: {tensors[5].shape}")
+        inputs[name] = {0: "N"}
+        outputs[f"new_{name}"] = {0: "N"}
+        input_names.append(name)
+        output_names.append(f"new_{name}")
+
+    num_encoder_layers = ",".join(map(str, encoder_model.encoder.num_encoder_layers))
+    encoder_dims = ",".join(map(str, encoder_model.encoder.encoder_dim))
+    cnn_module_kernels = ",".join(map(str, encoder_model.encoder.cnn_module_kernel))
+    ds = encoder_model.encoder.downsampling_factor
+    left_context_len = encoder_model.left_context_len
+    left_context_len = [left_context_len // k for k in ds]
+    left_context_len = ",".join(map(str, left_context_len))
+    query_head_dims = ",".join(map(str, encoder_model.encoder.query_head_dim))
+    value_head_dims = ",".join(map(str, encoder_model.encoder.value_head_dim))
+    num_heads = ",".join(map(str, encoder_model.encoder.num_heads))
+
+    meta_data = {
+        "model_type": "zipformer2",
+        "version": "1",
+        "model_author": "k2-fsa",
+        "comment": "streaming zipformer2",
+        "decode_chunk_len": str(decode_chunk_len),  # 32
+        "T": str(T),  # 32+7+2*3=45
+        "num_encoder_layers": num_encoder_layers,
+        "encoder_dims": encoder_dims,
+        "cnn_module_kernels": cnn_module_kernels,
+        "left_context_len": left_context_len,
+        "query_head_dims": query_head_dims,
+        "value_head_dims": value_head_dims,
+        "num_heads": num_heads,
+    }
+    if use_whisper_features:
+        meta_data["feature"] = "whisper"
+
+    logging.info(f"meta_data: {meta_data}")
+
+    for i in range(len(init_state[:-2]) // 6):
+        build_inputs_outputs(init_state[i * 6 : (i + 1) * 6], i)
+
+    # (batch_size, channels, left_pad, freq)
+    embed_states = init_state[-2]
+    name = "embed_states"
+    logging.info(f"{name}.shape: {embed_states.shape}")
+    inputs[name] = {0: "N"}
+    outputs[f"new_{name}"] = {0: "N"}
+    input_names.append(name)
+    output_names.append(f"new_{name}")
+
+    # (batch_size,)
+    processed_lens = init_state[-1]
+    name = "processed_lens"
+    logging.info(f"{name}.shape: {processed_lens.shape}")
+    inputs[name] = {0: "N"}
+    outputs[f"new_{name}"] = {0: "N"}
+    input_names.append(name)
+    output_names.append(f"new_{name}")
+
+    logging.info(inputs)
+    logging.info(outputs)
+    logging.info(input_names)
+    logging.info(output_names)
+
+    torch.onnx.export(
+        encoder_model,
+        (x, init_state),
+        encoder_filename,
+        verbose=False,
+        opset_version=opset_version,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes={
+            "x": {0: "N"},
+            "encoder_out": {0: "N"},
+            **inputs,
+            **outputs,
+        }
+        if dynamic_batch
+        else {},
+        **get_onnx_export_kwargs(),
+)
+
+    add_meta_data(
+        filename=encoder_filename,
+        meta_data=meta_data,
+        use_external_data=use_external_data,
+    )
+
+
+def export_decoder_model_onnx(
+    decoder_model: OnnxDecoder,
+    decoder_filename: str,
+    opset_version: int = 11,
+    dynamic_batch: bool = True,
+    use_int32_inputs: int = 0,
+) -> None:
+    """Export the decoder model to ONNX format.
+
+    The exported model has one input:
+
+        - y: a torch.int64 tensor of shape (N, decoder_model.context_size)
+
+    and has one output:
+
+        - decoder_out: a torch.float32 tensor of shape (N, joiner_dim)
+
+    Args:
+      decoder_model:
+        The decoder model to be exported.
+      decoder_filename:
+        Filename to save the exported ONNX model.
+      opset_version:
+        The opset version to use.
+    """
+    context_size = decoder_model.decoder.context_size
+    vocab_size = decoder_model.decoder.vocab_size
+
+    if use_int32_inputs:
+        y = torch.zeros(1, context_size, dtype=torch.int32)
+    else:
+        y = torch.zeros(1, context_size, dtype=torch.int64)
+
+    decoder_model = torch.jit.script(decoder_model)
+    torch.onnx.export(
+        decoder_model,
+        y,
+        decoder_filename,
+        verbose=False,
+        opset_version=opset_version,
+        input_names=["y"],
+        output_names=["decoder_out"],
+        dynamic_axes={
+            "y": {0: "N"},
+            "decoder_out": {0: "N"},
+        }
+        if dynamic_batch
+        else {},
+        **get_onnx_export_kwargs(),
+)
+
+    meta_data = {
+        "context_size": str(context_size),
+        "vocab_size": str(vocab_size),
+    }
+    add_meta_data(filename=decoder_filename, meta_data=meta_data)
+
+
+def export_joiner_model_onnx(
+    joiner_model: nn.Module,
+    joiner_filename: str,
+    opset_version: int = 11,
+    dynamic_batch: bool = True,
+) -> None:
+    """Export the joiner model to ONNX format.
+    The exported joiner model has two inputs:
+
+        - encoder_out: a tensor of shape (N, joiner_dim)
+        - decoder_out: a tensor of shape (N, joiner_dim)
+
+    and produces one output:
+
+        - logit: a tensor of shape (N, vocab_size)
+    """
+    joiner_dim = joiner_model.output_linear.weight.shape[1]
+    logging.info(f"joiner dim: {joiner_dim}")
+
+    projected_encoder_out = torch.rand(1, joiner_dim, dtype=torch.float32)
+    projected_decoder_out = torch.rand(1, joiner_dim, dtype=torch.float32)
+
+    torch.onnx.export(
+        joiner_model,
+        (projected_encoder_out, projected_decoder_out),
+        joiner_filename,
+        verbose=False,
+        opset_version=opset_version,
+        input_names=[
+            "encoder_out",
+            "decoder_out",
+        ],
+        output_names=["logit"],
+        dynamic_axes={
+            "encoder_out": {0: "N"},
+            "decoder_out": {0: "N"},
+            "logit": {0: "N"},
+        }
+        if dynamic_batch
+        else {},
+        **get_onnx_export_kwargs(),
+)
+    meta_data = {
+        "joiner_dim": str(joiner_dim),
+    }
+    add_meta_data(filename=joiner_filename, meta_data=meta_data)
+
+
+@torch.no_grad()
+def main():
+    """Export a streaming zipformer transducer model to ONNX format."""
+    args = get_parser().parse_args()
+    args.exp_dir = Path(args.exp_dir)
+
+    params = get_params()
+    params.update(vars(args))
+
+    device = torch.device("cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda", 0)
+
+    logging.info(f"device: {device}")
+
+    token_table = k2.SymbolTable.from_file(params.tokens)
+    params.blank_id = token_table["<blk>"]
+    params.vocab_size = num_tokens(token_table) + 1
+
+    logging.info(params)
+
+    logging.info("About to create model")
+    model = get_model(params)
+
+    model.to(device)
+
+    if not params.use_averaged_model:
+        if params.iter > 0:
+            filenames = find_checkpoints(params.exp_dir, iteration=-params.iter)[
+                : params.avg
+            ]
+            if len(filenames) == 0:
+                raise ValueError(
+                    f"No checkpoints found for"
+                    f" --iter {params.iter}, --avg {params.avg}"
+                )
+            elif len(filenames) < params.avg:
+                raise ValueError(
+                    f"Not enough checkpoints ({len(filenames)}) found for"
+                    f" --iter {params.iter}, --avg {params.avg}"
+                )
+            logging.info(f"averaging {filenames}")
+            model.to(device)
+            model.load_state_dict(
+                average_checkpoints(filenames, device=device), strict=False
+            )
+        elif params.avg == 1:
+            load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
+        else:
+            start = params.epoch - params.avg + 1
+            filenames = []
+            for i in range(start, params.epoch + 1):
+                if i >= 1:
+                    filenames.append(f"{params.exp_dir}/epoch-{i}.pt")
+            logging.info(f"averaging {filenames}")
+            model.to(device)
+            model.load_state_dict(
+                average_checkpoints(filenames, device=device), strict=False
+            )
+    else:
+        if params.iter > 0:
+            filenames = find_checkpoints(params.exp_dir, iteration=-params.iter)[
+                : params.avg + 1
+            ]
+            if len(filenames) == 0:
+                raise ValueError(
+                    f"No checkpoints found for"
+                    f" --iter {params.iter}, --avg {params.avg}"
+                )
+            elif len(filenames) < params.avg + 1:
+                raise ValueError(
+                    f"Not enough checkpoints ({len(filenames)}) found for"
+                    f" --iter {params.iter}, --avg {params.avg}"
+                )
+            filename_start = filenames[-1]
+            filename_end = filenames[0]
+            logging.info(
+                "Calculating the averaged model over iteration checkpoints"
+                f" from {filename_start} (excluded) to {filename_end}"
+            )
+            model.to(device)
+            model.load_state_dict(
+                average_checkpoints_with_averaged_model(
+                    filename_start=filename_start,
+                    filename_end=filename_end,
+                    device=device,
+                ),
+                strict=False,
+            )
+        else:
+            assert params.avg > 0, params.avg
+            start = params.epoch - params.avg
+            assert start >= 1, start
+            filename_start = f"{params.exp_dir}/epoch-{start}.pt"
+            filename_end = f"{params.exp_dir}/epoch-{params.epoch}.pt"
+            logging.info(
+                f"Calculating the averaged model over epoch range from "
+                f"{start} (excluded) to {params.epoch}"
+            )
+            model.to(device)
+            model.load_state_dict(
+                average_checkpoints_with_averaged_model(
+                    filename_start=filename_start,
+                    filename_end=filename_end,
+                    device=device,
+                ),
+                strict=False,
+            )
+
+    model.to("cpu")
+    model.eval()
+
+    convert_scaled_to_non_scaled(model, inplace=True)
+
+    encoder = OnnxEncoder(
+        encoder=model.encoder,
+        encoder_embed=model.encoder_embed,
+        encoder_proj=model.joiner.encoder_proj,
+        is_rknn_export=params.is_rknn_export,
+    )
+
+    if params.decoder_conv_as_matmul:
+        # keep the original decoder to check the exported model against it
+        conv_decoder = OnnxDecoder(
+            decoder=copy.deepcopy(model.decoder),
+            decoder_proj=copy.deepcopy(model.joiner.decoder_proj),
+        )
+        replace_decoder_conv_with_matmul(model.decoder)
+        logging.info("Export the decoder conv as MatMul")
+
+    decoder = OnnxDecoder(
+        decoder=model.decoder,
+        decoder_proj=model.joiner.decoder_proj,
+    )
+
+    joiner = OnnxJoiner(output_linear=model.joiner.output_linear)
+
+    encoder_num_param = sum([p.numel() for p in encoder.parameters()])
+    decoder_num_param = sum([p.numel() for p in decoder.parameters()])
+    joiner_num_param = sum([p.numel() for p in joiner.parameters()])
+    total_num_param = encoder_num_param + decoder_num_param + joiner_num_param
+    logging.info(f"encoder parameters: {encoder_num_param}")
+    logging.info(f"decoder parameters: {decoder_num_param}")
+    logging.info(f"joiner parameters: {joiner_num_param}")
+    logging.info(f"total parameters: {total_num_param}")
+
+    if params.iter > 0:
+        suffix = f"iter-{params.iter}"
+    else:
+        suffix = f"epoch-{params.epoch}"
+
+    suffix += f"-avg-{params.avg}"
+    suffix += f"-chunk-{params.chunk_size}"
+    suffix += f"-left-{params.left_context_frames}"
+
+    opset_version = 13
+
+    logging.info("Exporting encoder")
+    if params.use_external_data:
+        encoder_filename = f"encoder-{suffix}.onnx"
+    else:
+        encoder_filename = params.exp_dir / f"encoder-{suffix}.onnx"
+    export_encoder_model_onnx(
+        encoder,
+        str(encoder_filename),
+        opset_version=opset_version,
+        feature_dim=params.feature_dim,
+        dynamic_batch=params.dynamic_batch == 1,
+        use_int32_inputs=params.use_int32_inputs,
+        use_whisper_features=params.use_whisper_features,
+        use_external_data=params.use_external_data,
+    )
+    logging.info(f"Exported encoder to {encoder_filename}")
+
+    logging.info("Exporting decoder")
+    decoder_filename = params.exp_dir / f"decoder-{suffix}.onnx"
+    export_decoder_model_onnx(
+        decoder,
+        decoder_filename,
+        opset_version=opset_version,
+        dynamic_batch=params.dynamic_batch == 1,
+        use_int32_inputs=params.use_int32_inputs,
+    )
+    logging.info(f"Exported decoder to {decoder_filename}")
+
+    if params.decoder_conv_as_matmul:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            conv_filename = f"{tmp_dir}/decoder-conv.onnx"
+            export_decoder_model_onnx(
+                conv_decoder,
+                conv_filename,
+        opset_version=opset_version,
+        dynamic_batch=params.dynamic_batch == 1,
+        use_int32_inputs=params.use_int32_inputs,
+            )
+            max_diff, device = check_decoder_conv_as_matmul_onnx(
+                conv_filename,
+                str(decoder_filename),
+                vocab_size=model.decoder.vocab_size,
+            )
+        logging.info(
+            "Checked the decoder with MatMul against the decoder with Conv "
+            f"(onnxruntime on {device}): max abs diff {max_diff:.2e}"
+        )
+
+    logging.info("Exporting joiner")
+    joiner_filename = params.exp_dir / f"joiner-{suffix}.onnx"
+    export_joiner_model_onnx(
+        joiner,
+        joiner_filename,
+        opset_version=opset_version,
+        dynamic_batch=params.dynamic_batch == 1,
+    )
+    logging.info(f"Exported joiner to {joiner_filename}")
+
+    if params.is_rknn_export:
+        if params.use_external_data:
+            logging.warning(
+                "--is-rknn-export 1: skip removing no-op Cast nodes since "
+                "--use-external-data is used. Note its other effects (bool "
+                "masks etc.) are still applied to the exported graph."
+            )
+        else:
+            for filename in (encoder_filename, decoder_filename, joiner_filename):
+                model = onnx.load(str(filename))
+                num_removed = _remove_noop_cast_nodes(model)
+                if num_removed > 0:
+                    onnx.save(model, str(filename))
+                logging.info(
+                    f"Removed {num_removed} no-op Cast node(s) from {filename}"
+                )
+
+    if params.fp16:
+        logging.info("Generate fp16 models")
+
+        if params.use_external_data:
+            encoder_filename_fp16 = f"encoder-{suffix}.fp16.onnx"
+            export_onnx_fp16_large_2gb(encoder_filename, encoder_filename_fp16)
+        else:
+            encoder_filename_fp16 = params.exp_dir / f"encoder-{suffix}.fp16.onnx"
+            export_onnx_fp16(encoder_filename, encoder_filename_fp16)
+
+        decoder_filename_fp16 = params.exp_dir / f"decoder-{suffix}.fp16.onnx"
+        export_onnx_fp16(decoder_filename, decoder_filename_fp16)
+
+        joiner_filename_fp16 = params.exp_dir / f"joiner-{suffix}.fp16.onnx"
+        export_onnx_fp16(joiner_filename, joiner_filename_fp16)
+
+    # Generate int8 quantization models
+    # See https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html#data-type-selection
+
+    if params.enable_int8_quantization:
+        logging.info("Generate int8 quantization models")
+
+        if params.use_external_data:
+            encoder_filename_int8 = f"encoder-{suffix}.int8.onnx"
+        else:
+            encoder_filename_int8 = params.exp_dir / f"encoder-{suffix}.int8.onnx"
+
+        quantize_dynamic(
+            model_input=encoder_filename,
+            model_output=encoder_filename_int8,
+            op_types_to_quantize=["MatMul"],
+            weight_type=QuantType.QInt8,
+        )
+
+        decoder_filename_int8 = params.exp_dir / f"decoder-{suffix}.int8.onnx"
+        quantize_dynamic(
+            model_input=decoder_filename,
+            model_output=decoder_filename_int8,
+            op_types_to_quantize=["MatMul", "Gather"],
+            weight_type=QuantType.QInt8,
+        )
+
+        joiner_filename_int8 = params.exp_dir / f"joiner-{suffix}.int8.onnx"
+        quantize_dynamic(
+            model_input=joiner_filename,
+            model_output=joiner_filename_int8,
+            op_types_to_quantize=["MatMul"],
+            weight_type=QuantType.QInt8,
+        )
+
+
+if __name__ == "__main__":
+    formatter = "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
+    logging.basicConfig(format=formatter, level=logging.INFO)
+    main()
